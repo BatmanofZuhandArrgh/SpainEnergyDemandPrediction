@@ -1,0 +1,43 @@
+
+```{r}
+library(fpp3)
+library(tsibble)
+library(lubridate)
+
+```
+Source: https://www.kaggle.com/datasets/manualrg/spanish-electricity-market-demand-gen-price
+
+#Project Setup
+```{r}
+setwd('/home/anhnguyen/Documents/electricity_demand_prediction')
+#Edit path to load data
+full_table <- read.csv(file = 'spain_energy_market.csv')
+real_demand <- filter(full_table, name == "Demanda real")
+
+real_demand$datetime <- ymd_hms(real_demand$datetime)
+
+real_demand <- as_tsibble(real_demand, index = 'datetime')
+real_demand
+```
+#Introduction
+Source: https://www.kaggle.com/datasets/manualrg/spanish-electricity-market-demand-gen-price
+From MANUALRG
+The full dataset has daily stats of the following, from 2014 to 2018:
+- Demanda programada PBF total (MWh): Schedulled Total Demand
+- Demanda real (MW): Actual demanded power
+- Energía asignada en Mercado SPOT Diario España (MWh): Energy traded in daily spot Spanish market (OMIE)
+- Energía asignada en Mercado SPOT Diario Francia (MWh): Energy traded in daily spot French market
+- ... (More in the source Kaggle pages)
+Forecasting energy demand is extremely important for the scheduling of energy production, and to support the transition to green energy. 
+This dataset is appropriate for the job because it lasts for 3.5 years, long enough to capture some trend and seasonality within a year, while also having daily data, a level of granularity that can show cycles within months or weeks. 
+For the first step, we can try to forecast actual demand by its own history. In the next steps, we can try to use the predicted demand and scheduled productions of various type of energy to predict price. Knowing the price, we would be able to advise businesses and consumers on their energy consumption planning, and make a case for utilizing green energy, if the forecast looks favorably on this position.
+
+```{r}
+real_demand <- real_demand %>% select(-c(id,geoid, name, geoname))
+real_demand %>% drop_na(value)
+```
+```{r}
+real_demand %>% autoplot(value)
+
+```
+
