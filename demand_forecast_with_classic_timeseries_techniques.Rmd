@@ -1,0 +1,222 @@
+
+```{r}
+library(fpp3)
+library(tsibble)
+library(lubridate)
+
+```
+Source: https://www.kaggle.com/datasets/manualrg/spanish-electricity-market-demand-gen-price
+#Project Setup
+#Data wrangling
+```{r}
+setwd('/home/anhnguyen/Documents/electricity_demand_prediction')
+#Edit path to load data
+full_table <- read.csv(file = 'spain_energy_market.csv')
+real_demand <- filter(full_table, name == "Demanda real")
+
+real_demand$datetime <- ymd_hms(real_demand$datetime)
+
+real_demand$datetime <- as_date(real_demand$datetime)
+
+real_demand <- as_tsibble(real_demand, index = 'datetime')
+real_demand
+```
+#Introduction
+Source: https://www.kaggle.com/datasets/manualrg/spanish-electricity-market-demand-gen-price
+From MANUALRG
+The full dataset has daily stats of the following, from 2014 to 2018:
+- Demanda programada PBF total (MWh): Schedulled Total Demand
+- Demanda real (MW): Actual demanded power
+- Energía asignada en Mercado SPOT Diario España (MWh): Energy traded in daily spot Spanish market (OMIE)
+- Energía asignada en Mercado SPOT Diario Francia (MWh): Energy traded in daily spot French market
+- ... (More in the source Kaggle pages)
+Forecasting energy demand is extremely important for the scheduling of energy production, and to support the transition to green energy. 
+This dataset is appropriate for the job because it lasts for 3.5 years, long enough to capture some trend and seasonality within a year, while also having daily data, a level of granularity that can show cycles within months or weeks. 
+For the first step, we can try to forecast actual demand by its own history. In the next steps, we can try to use the predicted demand and scheduled productions of various type of energy to predict price. Knowing the price, we would be able to advise businesses and consumers on their energy consumption planning, and make a case for utilizing green energy, if the forecast looks favorably on this position.
+
+```{r}
+real_demand <- real_demand %>% select(-c(id,geoid, name, geoname))
+real_demand %>% drop_na(value)
+```
+#Exploratory analysis and visualization for the dataset
+```{r}
+real_demand %>% autoplot(value)
+real_demand %>% gg_season(value, period = 'year')
+real_demand %>% gg_season(value, period = 'month')
+real_demand %>% gg_season(value, period = 'week')
+
+```
+We find that there is a slight trend increasing and an element of seasonality. The data repeats its cycle int terms of year and week
+```{r}
+lambda <- real_demand %>% 
+  features(value, features = guerrero) %>% 
+  pull(lambda_guerrero)
+
+#stablize variation?
+real_demand %>% 
+  model(
+  STL(value)) %>%
+  components() %>%
+  autoplot()
+
+real_demand %>% 
+  model(
+    STL(box_cox(value, lambda))) %>% 
+  components() %>% 
+  autoplot()
+
+```
+Box cox Transformation did make range and mean of the components shift, but the ways the series vary look pretty much the same. Box cox transform for forecasting may not be needed.
+
+The decomposition confirmed that there is a yearly seasonal components and a weekly seasonal components (additive). We can try to forecast on the raw time series, then we can try to increase accuracy by using the components.
+
+#Model fitting
+```{r}
+train <- real_demand %>% filter(datetime <= date('2017-12-30'))
+test <- real_demand %>% filter(datetime > date('2017-12-30'))
+train
+test
+```
+Convention is a 80-20 split. This data consist of 5 full years, I want to test to see if it can extrapolate a full year
+#ETS for raw data
+```{r}
+exSm <- train %>% 
+  model(auto_ets = ETS(value))
+glance(exSm)
+fc_ets <- exSm %>% forecast(h = "1 years")
+fc_ets %>% autoplot(train, level = NULL)
+exSm %>% gg_tsresiduals()
+
+```
+The automatic ets model chosen, from the visualization, does not seem very good, and does seem like a trivial solution (even though the residuals of the error looks like white noise from its distribution). We should treat this as a baseline.
+
+
+#ARIMA for raw data
+```{r}
+train %>% features(value, list(unitroot_kpss, unitroot_ndiffs))
+train %>% features(difference(value, 12), list(unitroot_kpss, unitroot_ndiffs))
+```
+It is recommended to take only 1 difference, and after taking the monthly seasonal diff, the pvalue is 0.1 > 0.05, so it's fair to say that demand_diff is stationary
+```{r}
+train <- train %>% 
+      mutate(s_value_diff = difference(value, 12))
+autoplot(train, s_value_diff)
+```
+```{r}
+train %>% gg_tsdisplay(s_value_diff, plot_type = "partial")
+
+```
+Neither plots dies out in decay or wave forms. So it should not be purely modeled by AR or MA
+```{r}
+arima <- train %>% model(
+    auto_arima = ARIMA(value))
+
+glance(arima)
+fc <- arima %>% forecast(h = "1 years")
+fc %>% autoplot(train, level = NULL)
+arima %>% gg_tsresiduals()
+```
+Again, the residual looks like it's normally distributed, with mean = 0, with mostly constant variance. Also, it's obvious the model does not generalize to the test set.
+
+#TSLM for raw data
+Using the previous differented s_value_diff to do linear regression
+```{r}
+train <- train %>% 
+  mutate(
+        lag_diff_1 = lag(s_value_diff, 1),
+        lag_diff_2 = lag(s_value_diff, 2),
+        lag_diff_3 = lag(s_value_diff, 3),
+        lag_diff_4 = lag(s_value_diff, 4),
+        lag_diff_5 = lag(s_value_diff, 5),
+        lag_diff_6 = lag(s_value_diff, 6),
+        lag_diff_7 = lag(s_value_diff, 7))
+train <- train %>%
+  filter(!is.na(lag_diff_1)) %>% 
+  filter(!is.na(lag_diff_2)) %>% 
+  filter(!is.na(lag_diff_3)) %>% 
+  filter(!is.na(lag_diff_4)) %>% 
+  filter(!is.na(lag_diff_5)) %>% 
+  filter(!is.na(lag_diff_6)) %>% 
+  filter(!is.na(lag_diff_7))
+```
+Take the last 7 days lag as predictor variables
+```{r}
+train
+```
+
+```{r}
+lr <- train %>% 
+  model(
+    lm = TSLM(s_value_diff ~ lag_diff_1 + lag_diff_2 + lag_diff_3 + lag_diff_4 + lag_diff_5 + lag_diff_6 + lag_diff_7)
+  )
+glance(lr)
+report(lr)
+lr %>% gg_tsresiduals()
+```
+Although, we cannot compare directly with other models, since this report is evaluating the prediction s_value_diff, not value.
+Also, with the autocorrelation with so many spikes passing the threshold, this error is probably not white noise. It can probably be improved.
+
+# All models
+```{r}
+auto_model <- train %>% 
+  model(
+    auto_ets = ETS(value),
+    auto_log_ets = ETS(log(value)),
+    auto_box_cox_ets = ETS(value, lambda = lambda),
+    auto_arima = ARIMA(value),
+    auto_log_arima = ARIMA(log(value)),
+    auto_box_cox_arima = ARIMA(value, lambda = lambda)
+    )
+
+glance(auto_model)
+```
+```{r}
+auto_model %>% forecast(new_data = train) %>% accuracy(train)
+```
+
+With box-cox transformed data, we were not able to find a model that works. So arima is better as a model than ets, for both value and log(value), based on their smaller AICc. Although we need to check performance on the test set to truly which model can generalize on the data.
+
+```{r}
+auto_model <- train %>% 
+  model(    
+    mean = MEAN(value),
+    naive = NAIVE(value),
+    drift = RW(value ~ drift()),
+    lm = TSLM(value ~ trend()),
+    auto_ets = ETS(value),
+    auto_log_ets = ETS(log(value)),
+    auto_arima = ARIMA(value),
+    auto_log_arima = ARIMA(log(value))
+    )
+```
+
+```{r}
+auto_model %>% forecast(new_data = test) %>% accuracy(test)
+
+```
+I'd like to choose MAE as my metrics to assess accuracy. Since it's absolute, the negative and positive error will not cancel out (unlike ME or MPE). MAE is less sensitive to outliers than RMSE, which would sum the square or error before taking root. And since there might be data points with value smaller than one, which will unreasonably explode the MAPE, we choose MAE. 
+
+We found that auto_ets is most accurate. It has the lowest MAE on test set and train set. Although comparatively, the best auto_arima also has comparable MAE on the whole test set (neglectable difference), but with significantly smaller AICc. Then we choose the auto_arima model with the following stats: ARIMA 102210
+```{r}
+auto_model %>% select(auto_arima) %>% report()
+```
+```{r}
+best_arima <- auto_model %>% select(auto_arima)
+
+forecast(best_arima, test) %>%
+  autoplot(test)
+
+
+forecast(best_arima, test) %>%
+  autoplot(real_demand)
+```
+Forecasting 1 year into the future, to 2020. Which means another 365 steps.
+```{r}
+fc <- best_arima %>% forecast(h = "2 years")
+fc %>% autoplot(real_demand, level = NULL)
+```
+As one can see, it can be a lot lot better. We will try other models on a different python notebook. 
+We will probably need other models to before going into production. A 6% mean absolute error rate isn't the worst, but with more feature engineering, another model could easily capture the variance in the data. 
+Also, as everyone probably knows, some events in 2020 may stop the entire world from doing business as usual. With offices using little to none energy, and homes using more energy, it will definitely change the structure of the demand for electricity for Spain. This model wouldn't work with such a drastic change in the data, and thus cannot be deployed. This applies to all other huge disruption to the data, like a war or a recession.
+
+
